@@ -112,6 +112,11 @@ requested payment.
 - **Value conservation:** the underlying is CLAIMED to the holder in the same bundle (no bare settlement
   coin holding the underlying survives — nothing is left for a key-free thief); the strike is paid to the
   creator's requested payment. No value is created.
+- **Builder-enforced underlying claim:** the returned `coin_spends` carry a settlement spend that claims
+  the underlying to the holder. **Consensus enforces the strike payment to the creator, but does NOT
+  enforce the underlying claim — only the builder enforces it.** Callers MUST broadcast the full
+  returned bundle intact. Dropping or reordering the underlying-claim spend strands the underlying at a
+  bare settlement coin that any mempool watcher can claim key-free.
 - **Returns** `created: None`.
 
 ### 5.3 `clawback(ctx, creator, created) -> OptionSpend`
@@ -189,6 +194,15 @@ locked-forever (§8.6).
    exactly the locked amount. (Tests: `create_then_exercise_round_trip` asserts the holder nets exactly
    `underlying − strike` and the creator nets the strike; `exercise_leaves_no_orphan_underlying_settlement_coin`
    asserts no bare settlement coin survives.)
+9. **Builder-enforced underlying-claim leg (not consensus-enforced).** The `exercise` builder emits a
+   settlement spend that claims the unlocked underlying to the holder in the SAME bundle as the strike
+   payment. Consensus enforces the strike leg (the option puzzle asserts the settlement payment) but
+   does NOT enforce the underlying claim — only the builder enforces it. Callers MUST broadcast the
+   full returned `coin_spends` intact. Any caller that drops or reorders the underlying-claim spend
+   strands the underlying at a public settlement coin, allowing any mempool watcher to claim it
+   key-free even though the holder has paid the strike and received nothing. (Test:
+   `exercise_drops_underlying_claim_leaves_coin_strandable`.)
+
 
 ## 9. Conformance
 

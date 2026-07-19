@@ -42,6 +42,13 @@ pub struct StrikePayment {
 /// settlement leg is a documented follow-up.
 ///
 /// **Pure: does NOT sign or broadcast.** Returns [`OptionSpend`] with `created: None`.
+///
+/// **CRITICAL: The returned `coin_spends` include the settlement leg that claims the unlocked
+/// underlying to the holder.** That leg is REQUIRED but only builder-enforced: consensus forces
+/// the strike payment to the creator, but does NOT force the underlying claim. Callers MUST
+/// broadcast the full returned bundle intact — dropping or reordering the underlying-claim spend
+/// strands the underlying at a publicly-claimable settlement coin that anyone can take. Never
+/// submit a subset of these spends.
 pub fn exercise(
     ctx: &mut SpendContext,
     holder: &Owner,
