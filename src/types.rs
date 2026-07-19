@@ -39,9 +39,7 @@ impl Owner<'_> {
     /// (a Custom owner skips that check — the consensus still enforces the real path).
     pub fn standard_puzzle_hash(&self) -> Option<Bytes32> {
         match self {
-            Owner::Standard(public_key) => {
-                Some(StandardArgs::curry_tree_hash(*public_key).into())
-            }
+            Owner::Standard(public_key) => Some(StandardArgs::curry_tree_hash(*public_key).into()),
             Owner::Custom(_) => None,
         }
     }

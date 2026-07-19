@@ -5,8 +5,8 @@
 //! clawback path (valid only strictly after `expiry_seconds`, enforced by the consensus).
 //! The creator's inner spend is authorized through the caller's [`Owner`] layer.
 
-use chia_wallet_sdk::driver::{SpendContext, SpendWithConditions};
 use chia_puzzle_types::Memos;
+use chia_wallet_sdk::driver::{SpendContext, SpendWithConditions};
 use chia_wallet_sdk::types::Conditions;
 
 use crate::error::{Error, Result};

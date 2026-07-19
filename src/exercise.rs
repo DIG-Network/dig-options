@@ -66,9 +66,7 @@ pub fn exercise(
 
     // Spend the option singleton through its exercise path (the holder authorizes it).
     // `OptionContract` is `Copy`, so this copies rather than moves `created.option`.
-    created
-        .option
-        .exercise(ctx, holder, Conditions::new())?;
+    created.option.exercise(ctx, holder, Conditions::new())?;
 
     // Unlock the locked underlying XCH to the option's inner puzzle hash (the holder).
     created.underlying.exercise_coin_spend(
