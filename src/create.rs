@@ -9,7 +9,7 @@
 use chia_protocol::Coin;
 use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{
-    OptionLauncher, OptionLauncherInfo, SpendContext, SpendWithConditions,
+    OptionLauncher, OptionLauncherInfo, OptionType, SpendContext, SpendWithConditions,
 };
 
 use crate::error::{Error, Result};
@@ -36,6 +36,15 @@ pub fn create(
     if terms.underlying_amount == 0 {
         return Err(Error::invalid(
             "option underlying amount must be greater than zero",
+        ));
+    }
+    // v0.1.0 exercise supports only an XCH strike, so minting a non-XCH-strike option would
+    // create an option no holder could ever exercise (an asymmetric loss — the creator claws it
+    // back after expiry). Keep create/exercise support symmetric by rejecting it up front, with
+    // the same message shape as the exercise guard. CAT/NFT strike lands with the follow-up.
+    if !matches!(terms.strike_type, OptionType::Xch { .. }) {
+        return Err(Error::invalid(
+            "CAT/NFT strike exercise not yet supported — see dig-options CAT/NFT follow-up",
         ));
     }
     let needed = terms.underlying_amount.checked_add(1).ok_or_else(|| {

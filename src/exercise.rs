@@ -8,7 +8,7 @@
 //! `expiry_seconds` (enforced by the consensus).
 
 use chia_protocol::Coin;
-use chia_puzzle_types::offer::SettlementPaymentsSolution;
+use chia_puzzle_types::offer::{NotarizedPayment, Payment, SettlementPaymentsSolution};
 use chia_puzzle_types::Memos;
 use chia_puzzles::SETTLEMENT_PAYMENT_HASH;
 use chia_wallet_sdk::driver::{
@@ -68,13 +68,41 @@ pub fn exercise(
     // `OptionContract` is `Copy`, so this copies rather than moves `created.option`.
     created.option.exercise(ctx, holder, Conditions::new())?;
 
-    // Unlock the locked underlying XCH to the option's inner puzzle hash (the holder).
+    // Unlock the locked underlying. The underlying's exercise-path delegated puzzle emits
+    // `CreateCoin(SETTLEMENT_PAYMENT_HASH, underlying_amount)` — the unlocked XCH lands on a BARE
+    // settlement/offer coin (spendable by anyone with a `SettlementPaymentsSolution`, no key). The
+    // `inner_puzzle_hash` argument here is ONLY the singleton co-spend proof (a `SingletonMember`
+    // check), NOT a payout destination. We MUST claim that settlement coin to the holder in this
+    // same bundle — otherwise the underlying is stranded and any mempool watcher steals it while
+    // the holder has paid the strike and received nothing.
     created.underlying.exercise_coin_spend(
         ctx,
         created.underlying_coin,
         created.option.info.inner_puzzle_hash().into(),
         created.option.coin.amount,
     )?;
+
+    // Claim the unlocked-underlying settlement coin to the holder (the option's current p2 owner),
+    // paying the full underlying amount, in the same bundle. Mirrors the strike leg below.
+    let underlying_settlement_coin = Coin::new(
+        created.underlying_coin.coin_id(),
+        SETTLEMENT_PAYMENT_HASH.into(),
+        created.underlying.amount,
+    );
+    let holder_payment = NotarizedPayment::new(
+        created.option.info.launcher_id,
+        vec![Payment::new(
+            created.option.info.p2_puzzle_hash,
+            created.underlying.amount,
+            Memos::None,
+        )],
+    );
+    let underlying_claim = SettlementLayer.construct_coin_spend(
+        ctx,
+        underlying_settlement_coin,
+        SettlementPaymentsSolution::new(vec![holder_payment]),
+    )?;
+    ctx.insert(underlying_claim);
 
     // Pay the XCH strike into the settlement puzzle, then settle it to the creator's
     // requested payment. The holder authorizes the strike-funding spend.

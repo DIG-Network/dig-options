@@ -20,11 +20,13 @@
 //!
 //! ## Scope (v0.1.0)
 //!
-//! The underlying is **XCH**. The strike may be any [`OptionType`] for [`create`], [`clawback`],
-//! and inspection (it is curried into the option puzzle), while [`exercise`] builds the full
-//! settlement leg for an **XCH strike**; a CAT/NFT strike exercise returns an honest
-//! [`Error::InvalidInput`] rather than an incorrect spend. CAT/NFT underlyings and strike
-//! exercise are a future extension. See `SPEC.md` for the normative contract.
+//! The underlying is **XCH**, and the strike is **XCH-only**: [`create`] REJECTS a non-XCH strike
+//! up front so create and [`exercise`] have symmetric support envelopes (no holder can acquire an
+//! option it could never exercise). [`exercise`] builds BOTH settlement legs for an XCH strike —
+//! the underlying is claimed to the holder and the strike is paid to the creator, in one bundle —
+//! and keeps its non-XCH guard as defense-in-depth. [`clawback`] and inspection work for any strike
+//! type curried into an existing option. CAT/revocable-CAT/NFT underlyings and strike are a future
+//! extension. See `SPEC.md` for the normative contract.
 
 #![forbid(unsafe_code)]
 

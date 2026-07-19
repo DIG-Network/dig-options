@@ -11,6 +11,7 @@
 //! built spends can be submitted to the simulator.
 
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
+use chia_puzzles::SETTLEMENT_PAYMENT_HASH;
 use chia_sdk_test::{sign_transaction, Simulator};
 use chia_wallet_sdk::driver::{SingletonInfo, SpendContext, StandardLayer};
 use chia_wallet_sdk::prelude::{SecretKey, Signature};
@@ -120,19 +121,21 @@ fn exercise_rejects_underfunded_strike() -> anyhow::Result<()> {
 
 #[test]
 fn exercise_rejects_non_xch_strike() -> anyhow::Result<()> {
-    // A CAT strike is a valid option to CREATE, but exercising it is a documented v0.1.0 gap:
-    // exercise returns an honest error rather than emitting an incorrect spend.
+    // Defense-in-depth: even if a CAT-strike option somehow reaches `exercise` (create now
+    // rejects it up front — see `create_rejects_non_xch_strike`), the exercise guard still
+    // returns an honest error rather than emitting an incorrect spend. Build a well-formed XCH
+    // option, then flip its strike type to CAT to drive the guard directly.
     let ctx = &mut SpendContext::new();
     let alice = bls("alice");
     let funding = Coin::new(Bytes32::default(), alice.puzzle_hash, 1_001);
-    let cat_strike = OptionType::Cat {
+    let terms = OptionTerms::new(alice.puzzle_hash, 1_000, xch(250), 10);
+    let mut created = create(ctx, &Owner::Standard(alice.pk), funding, &terms)?
+        .created
+        .unwrap();
+    created.underlying.strike_type = OptionType::Cat {
         asset_id: puzzle_hash("asset"),
         amount: 250,
     };
-    let terms = OptionTerms::new(alice.puzzle_hash, 1_000, cat_strike, 10);
-    let created = create(ctx, &Owner::Standard(alice.pk), funding, &terms)?
-        .created
-        .unwrap();
 
     let strike = StrikePayment {
         funding_coin: Coin::new(Bytes32::default(), alice.puzzle_hash, 1_000),
@@ -142,6 +145,24 @@ fn exercise_rejects_non_xch_strike() -> anyhow::Result<()> {
         format!("{err}").contains("CAT/NFT strike exercise not yet supported"),
         "got: {err}"
     );
+    Ok(())
+}
+
+#[test]
+fn create_rejects_non_xch_strike() -> anyhow::Result<()> {
+    // v0.1.0 create is XCH-strike-only: a non-XCH strike is rejected up front so no holder can
+    // acquire an option they could never exercise (create/exercise support envelopes are
+    // symmetric). CAT/NFT strikes land with the CAT/NFT follow-up.
+    let ctx = &mut SpendContext::new();
+    let alice = bls("alice");
+    let funding = Coin::new(Bytes32::default(), alice.puzzle_hash, 1_001);
+    let cat_strike = OptionType::Cat {
+        asset_id: puzzle_hash("asset"),
+        amount: 250,
+    };
+    let terms = OptionTerms::new(alice.puzzle_hash, 1_000, cat_strike, 10);
+    let err = create(ctx, &Owner::Standard(alice.pk), funding, &terms).unwrap_err();
+    assert!(format!("{err}").contains("CAT/NFT strike"), "got: {err}");
     Ok(())
 }
 
@@ -192,8 +213,41 @@ fn create_confirmed(
     Ok(created)
 }
 
+/// Create + confirm an option from arbitrary `terms` (funded + authorized by `creator`),
+/// allowing a holder distinct from the creator.
+fn create_confirmed_terms(
+    sim: &mut Simulator,
+    ctx: &mut SpendContext,
+    creator: &chia_sdk_test::BlsPairWithCoin,
+    terms: &OptionTerms,
+) -> anyhow::Result<CreatedOption> {
+    let spend = create(ctx, &Owner::Standard(creator.pk), creator.coin, terms)?;
+    let created = spend.created.clone().unwrap();
+    let sig = sign_for_sim(&spend.coin_spends, std::slice::from_ref(&creator.sk))?;
+    sim.new_transaction(SpendBundle::new(spend.coin_spends, sig))?;
+    assert!(
+        sim.coin_state(created.option.coin.coin_id()).is_some(),
+        "the option singleton should exist after create"
+    );
+    Ok(created)
+}
+
+/// Total unspent value at `puzzle_hash` (hinted + unhinted coins).
+fn balance(sim: &Simulator, puzzle_hash: Bytes32) -> u64 {
+    sim.unspent_coins(puzzle_hash, false)
+        .iter()
+        .map(|c| c.amount)
+        .sum()
+}
+
 #[test]
 fn create_then_exercise_round_trip() -> anyhow::Result<()> {
+    // A covered option minted by the CREATOR (alice) but OWNED by a DISTINCT holder (bob). On
+    // exercise both legs must land, and value must be conserved for BOTH parties:
+    //   - the HOLDER receives EXACTLY the underlying amount (the claimed underlying leg), and
+    //   - the CREATOR receives the strike amount (the strike-settlement leg).
+    // A single-key create/exercise would mask a stranded underlying (the holder never actually
+    // receives it), so the two parties are kept distinct here on purpose.
     let mut sim = Simulator::new();
     let ctx = &mut SpendContext::new();
 
@@ -201,39 +255,101 @@ fn create_then_exercise_round_trip() -> anyhow::Result<()> {
     let strike_amount = 250u64;
     let expiry = 10_000u64;
 
+    // Creator funds the create; the option is minted to a distinct holder.
     let alice = sim.bls(underlying_amount + 1);
-    let created = create_confirmed(
-        &mut sim,
-        ctx,
-        &alice,
+    let bob = bls("holder");
+    let terms = OptionTerms {
+        creator_puzzle_hash: alice.puzzle_hash,
+        owner_puzzle_hash: bob.puzzle_hash,
         underlying_amount,
-        strike_amount,
-        expiry,
-    )?;
+        strike_type: xch(strike_amount),
+        expiry_seconds: expiry,
+    };
+    let created = create_confirmed_terms(&mut sim, ctx, &alice, &terms)?;
 
-    // Exercise before expiry: pay the strike, unlock the underlying.
-    let strike_funding = sim.new_coin(alice.puzzle_hash, strike_amount);
+    // Exercise before expiry, authorized by the HOLDER (bob owns the option singleton). Bob
+    // funds the strike from his own coin. Snapshot balances AFTER funding so the strike coin is
+    // in the holder baseline — his net becomes exactly (underlying received - strike paid).
+    let strike_funding = sim.new_coin(bob.puzzle_hash, strike_amount);
+    let creator_before = balance(&sim, alice.puzzle_hash);
+    let holder_before = balance(&sim, bob.puzzle_hash);
+
     let spend = exercise(
         ctx,
-        &Owner::Standard(alice.pk),
+        &Owner::Standard(bob.pk),
         &created,
         &StrikePayment {
             funding_coin: strike_funding,
         },
     )?;
-    let sig = sign_for_sim(&spend.coin_spends, &[alice.sk])?;
+    let sig = sign_for_sim(&spend.coin_spends, &[bob.sk])?;
     sim.new_transaction(SpendBundle::new(spend.coin_spends, sig))?;
 
-    // The strike payment settles to the creator (here alice); its puzzle hash gains at least
-    // the strike amount, proving the exercise's settlement leg was accepted.
-    let owned = sim
-        .unspent_coins(alice.puzzle_hash, true)
+    // The holder receives EXACTLY the underlying (minus the strike he funded from his own coin),
+    // and the creator receives the strike — value conserved for both parties.
+    let creator_gain = balance(&sim, alice.puzzle_hash) - creator_before;
+    let holder_gain = balance(&sim, bob.puzzle_hash) as i128 - holder_before as i128;
+    assert_eq!(
+        creator_gain, strike_amount,
+        "the creator should receive exactly the strike ({strike_amount})"
+    );
+    assert_eq!(
+        holder_gain,
+        underlying_amount as i128 - strike_amount as i128,
+        "the holder should net exactly underlying - strike (received {underlying_amount}, paid {strike_amount})"
+    );
+    Ok(())
+}
+
+#[test]
+fn exercise_leaves_no_orphan_underlying_settlement_coin() -> anyhow::Result<()> {
+    // A third party MUST NOT be able to strand-then-steal the underlying: after a complete
+    // exercise, the underlying must already be claimed to the holder in the SAME bundle, leaving
+    // NO unspent bare settlement coin (SETTLEMENT_PAYMENT_HASH) holding the underlying that a
+    // mempool watcher could claim key-free.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let underlying_amount = 1_000u64;
+    let strike_amount = 250u64;
+
+    let alice = sim.bls(underlying_amount + 1);
+    let bob = bls("holder");
+    let terms = OptionTerms {
+        creator_puzzle_hash: alice.puzzle_hash,
+        owner_puzzle_hash: bob.puzzle_hash,
+        underlying_amount,
+        strike_type: xch(strike_amount),
+        expiry_seconds: 10_000,
+    };
+    let created = create_confirmed_terms(&mut sim, ctx, &alice, &terms)?;
+
+    let strike_funding = sim.new_coin(bob.puzzle_hash, strike_amount);
+    let spend = exercise(
+        ctx,
+        &Owner::Standard(bob.pk),
+        &created,
+        &StrikePayment {
+            funding_coin: strike_funding,
+        },
+    )?;
+    let sig = sign_for_sim(&spend.coin_spends, &[bob.sk])?;
+    sim.new_transaction(SpendBundle::new(spend.coin_spends, sig))?;
+
+    // No unspent coin sits at the bare settlement puzzle hash: both settlement legs were claimed
+    // in the exercise bundle, so nothing is left for a key-free thief.
+    let orphan = sim
+        .unspent_coins(SETTLEMENT_PAYMENT_HASH.into(), false)
         .iter()
-        .map(|c| c.amount)
-        .sum::<u64>();
+        .any(|c| c.amount == underlying_amount || c.amount == strike_amount);
     assert!(
-        owned >= strike_amount,
-        "the creator should receive at least the strike ({strike_amount}); got {owned}"
+        !orphan,
+        "no bare settlement coin holding the underlying/strike may survive a complete exercise"
+    );
+    // The holder actually holds the underlying value.
+    assert!(
+        balance(&sim, bob.puzzle_hash) >= underlying_amount - strike_amount,
+        "the holder must hold the claimed underlying after exercise"
     );
     Ok(())
 }

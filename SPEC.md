@@ -16,10 +16,12 @@ before expiry) and **clawback** (strictly after expiry, the creator reclaims the
 
 - **Underlying: XCH.** The locked asset is XCH; the underlying coin is a plain XCH coin at the option's
   1-of-2 path.
-- **Strike: any `OptionType` may be created and clawed back and inspected** (the strike is curried into
-  the option puzzle as data, so any strike type is well-formed at creation). **Exercise builds the full
-  settlement leg for an XCH strike**; a CAT/NFT strike exercise returns an error rather than an
-  incorrect spend (§6). Building the CAT/NFT strike-payment settlement leg is a future extension.
+- **Strike: XCH only (v0.1.0).** `create` REJECTS a non-XCH strike up front (§6), so create and
+  exercise have symmetric support envelopes — a holder can never acquire an option it could never
+  exercise. `parse`/`parse_child` still inspect any strike type curried into an existing option.
+  **Exercise builds the full settlement legs for an XCH strike** (both the underlying-claim leg to the
+  holder and the strike-payment leg to the creator); its non-XCH guard remains as defense-in-depth.
+  CAT/revocable-CAT/NFT strike (create + exercise) lands with the CAT/NFT follow-up (#1254).
 - **Future extension (stated positively):** CAT / revocable-CAT / NFT underlyings and CAT/NFT strike
   exercise use the same `OptionUnderlying::exercise_spend` / `clawback_spend` primitives wrapped for the
   asset; they are additive and land in a later minor version.
@@ -92,19 +94,24 @@ The identity fields recoverable from an option coin spend (§5.4): `option`, `la
 Locks `terms.underlying_amount` XCH and mints the option singleton to `terms.owner_puzzle_hash`.
 - **Emitted spends:** one `funding_coin` spend (through `creator`) that creates the launcher coin and the
   locked-underlying coin, plus the launcher/eve option spends.
-- **Enforced invariants:** `underlying_amount > 0`; `funding_coin.amount >= underlying_amount + 1`
+- **Enforced invariants:** `terms.strike_type` is `Xch` (v0.1.0; else error, §6, same shape as the
+  exercise guard); `underlying_amount > 0`; `funding_coin.amount >= underlying_amount + 1`
   (underlying + the 1-mojo singleton), computed with a checked add (overflow → error). Excess is an
   implicit fee.
 - **Returns** `created: Some(..)` — the handle for exercise/clawback.
 
 ### 5.2 `exercise(ctx, holder, created, strike) -> OptionSpend`
-Spends the option singleton through its exercise path, unlocks the underlying to the holder, pays the
-XCH strike into the settlement puzzle, and settles it to the creator's requested payment — one bundle.
+Spends the option singleton through its exercise path and builds BOTH settlement legs in one bundle:
+the unlocked underlying — which the exercise-path puzzle emits onto a bare settlement coin — is claimed
+to the holder (the option's current `p2_puzzle_hash`) via a `SettlementLayer` spend paying the full
+underlying amount, and the XCH strike is paid into the settlement puzzle and settled to the creator's
+requested payment.
 - **Enforced invariants:** `created.underlying.strike_type` is `Xch` (else error, §6); `strike.funding_coin.amount`
   ≥ the strike amount; the exercise's `AssertBeforeSecondsAbsolute(expiry)` boundary is enforced by the
   consensus (valid strictly before expiry).
-- **Value conservation:** the underlying is unlocked to the option's inner puzzle; the strike is paid to
-  the creator's requested payment. No value is created.
+- **Value conservation:** the underlying is CLAIMED to the holder in the same bundle (no bare settlement
+  coin holding the underlying survives — nothing is left for a key-free thief); the strike is paid to the
+  creator's requested payment. No value is created.
 - **Returns** `created: None`.
 
 ### 5.3 `clawback(ctx, creator, created) -> OptionSpend`
@@ -138,9 +145,10 @@ must sign, given the network's `agg_sig_me` additional data. Performs NO signing
 - `Driver(#[from] DriverError)` — a chia-wallet-sdk driver failure (allocation, currying, launcher mint).
 - `Signer(#[from] SignerError)` — a failure computing required signatures.
 - `InvalidInput(String)` — caller input that cannot produce a valid spend: zero underlying, overflow,
-  underfunded funding/strike coin, wrong-party clawback, or an unsupported (CAT/NFT) strike exercise. The
-  message states the precise violation. A CAT/NFT strike exercise returns this rather than emitting an
-  incorrect spend (an honest gap, never a silent/incorrect settlement).
+  underfunded funding/strike coin, wrong-party clawback, or an unsupported (CAT/NFT) strike (rejected at
+  BOTH create and exercise). The message states the precise violation. A non-XCH strike returns this
+  rather than minting an unexercisable option or emitting an incorrect spend (an honest gap, never a
+  silent/incorrect settlement).
 
 ## 7. Lifecycle state machine
 
@@ -150,8 +158,9 @@ must sign, given the network's `agg_sig_me` additional data. Performs NO signing
                               │  │
              exercise (before │  │ clawback (after expiry):
              expiry): strike  │  │ creator reclaims underlying
-             paid, underlying │  │
-             unlocked         ▼  ▼
+             paid to creator, │  │
+             underlying       │  │
+             claimed to holder▼  ▼
                            EXERCISED   CLAWED-BACK
 ```
 An option is created, then reaches exactly one terminal state: **exercised** (strictly before expiry) or
@@ -174,8 +183,12 @@ locked-forever (§8.6).
    boundary. (Tests: the round-trip + clawback-on-expiry.)
 7. **Wrong-party clawback rejected.** A `Standard` clawback owner mismatching the creator ph is rejected
    up front; the consensus enforces it regardless. (Test: `clawback_rejects_wrong_creator_key`.)
-8. **Value conservation.** Create requires `funding ≥ underlying + 1`; exercise conserves
-   underlying-to-holder + strike-to-creator; clawback recovers exactly the locked amount.
+8. **Value conservation.** Create requires `funding ≥ underlying + 1`; exercise conserves value for
+   both parties — the underlying is CLAIMED to the holder and the strike is paid to the creator in the
+   same bundle, leaving no orphan settlement coin a third party could claim key-free; clawback recovers
+   exactly the locked amount. (Tests: `create_then_exercise_round_trip` asserts the holder nets exactly
+   `underlying − strike` and the creator nets the strike; `exercise_leaves_no_orphan_underlying_settlement_coin`
+   asserts no bare settlement coin survives.)
 
 ## 9. Conformance
 

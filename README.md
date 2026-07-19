@@ -19,9 +19,11 @@ consumer signs the reported messages, assembles the `SpendBundle`, and broadcast
 
 ## Scope (v0.1.0)
 
-The underlying is **XCH**. The strike may be any type for create/clawback/inspect; **exercise** builds
-the full settlement leg for an **XCH strike** (a CAT/NFT strike exercise returns an honest error rather
-than an incorrect spend). CAT/NFT underlyings and strike exercise are a future extension. See `SPEC.md`.
+The underlying is **XCH** and the strike is **XCH-only**: `create` rejects a non-XCH strike up front so
+create and exercise stay symmetric (no unexercisable option can be minted). **exercise** builds both
+settlement legs for an XCH strike — the underlying is claimed to the holder and the strike is paid to
+the creator, in one bundle. `clawback`/inspect work for any strike curried into an existing option.
+CAT/NFT underlyings and strike are a future extension. See `SPEC.md`.
 
 ## Custody model (HARD invariants)
 
