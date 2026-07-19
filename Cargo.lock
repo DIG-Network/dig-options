@@ -803,9 +803,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chia-protocol",
+ "chia-puzzle-types",
+ "chia-puzzles",
  "chia-sdk-test",
  "chia-wallet-sdk",
- "hex",
+ "clvmr",
  "thiserror 2.0.19",
 ]
 
