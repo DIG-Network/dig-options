@@ -9,12 +9,19 @@ consumer signs the reported messages, assembles the `SpendBundle`, and broadcast
 
 ## What it builds
 
-- **create** — lock an underlying asset and mint the transferable option singleton (the "ticket"),
-  exercisable for a configured strike asset until an expiry.
+- **create** — lock an XCH underlying and mint the transferable option singleton (the "ticket"),
+  exercisable for a configured strike until an expiry.
 - **exercise** — the holder pays the strike into the settlement puzzle and unlocks the underlying to
   itself (rejected by consensus after expiry).
 - **clawback / cancel** — after expiry, the creator reclaims the locked underlying.
-- **inspect** — reconstruct an option (its terms + spendable coin) from an on-chain coin spend.
+- **inspect** — reconstruct a spendable option (its recoverable identity fields) from an on-chain coin
+  spend.
+
+## Scope (v0.1.0)
+
+The underlying is **XCH**. The strike may be any type for create/clawback/inspect; **exercise** builds
+the full settlement leg for an **XCH strike** (a CAT/NFT strike exercise returns an honest error rather
+than an incorrect spend). CAT/NFT underlyings and strike exercise are a future extension. See `SPEC.md`.
 
 ## Custody model (HARD invariants)
 
