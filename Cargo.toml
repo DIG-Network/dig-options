@@ -14,7 +14,7 @@
 # as v0.1.0 in a single triple-gated feature PR against this foundation.
 [package]
 name = "dig-options"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -32,8 +32,14 @@ categories = ["cryptography::cryptocurrencies", "api-bindings"]
 # coherent version set.
 chia-wallet-sdk = "0.30"
 # Direct type deps, pinned to EXACTLY the versions chia-wallet-sdk 0.30 resolves to (a mismatch is a
-# hard cargo error). chia-protocol carries wire types (`Coin`, `CoinSpend`, `Bytes32`).
+# hard cargo error). chia-protocol carries wire types (`Coin`, `CoinSpend`, `Bytes32`, `Program`).
 chia-protocol = "0.26"
+# `Memos` + the offer `SettlementPaymentsSolution` used to build the exercise strike-payment leg.
+chia-puzzle-types = "0.26"
+# `SETTLEMENT_PAYMENT_HASH` — the settlement puzzle hash the strike payment is paid into.
+chia-puzzles = "0.20"
+# The CLVM allocator used to run puzzles when computing required signatures (`sign`).
+clvmr = "0.14"
 # The crate error taxonomy (SPEC §6). thiserror 2 matches the sibling DIG crates.
 thiserror = "2"
 
@@ -41,5 +47,4 @@ thiserror = "2"
 # The in-process Chia Simulator + BLS keypair helpers for building + validating real coin spends in
 # tests (create -> exercise round-trip, create -> clawback-on-expiry).
 chia-sdk-test = "0.30"
-hex = "0.4"
 anyhow = "1"
