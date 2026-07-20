@@ -18,8 +18,8 @@ use chia_wallet_sdk::prelude::{SecretKey, Signature};
 use chia_wallet_sdk::types::{Conditions, TESTNET11_CONSTANTS};
 
 use dig_options::{
-    clawback, create, exercise, parse, parse_child, required_signatures, CreatedOption,
-    OptionTerms, OptionType, Owner, StrikePayment,
+    clawback, create, exercise, parse, parse_child, parse_metadata, rehydrate, required_signatures,
+    transfer, CreatedOption, OptionTerms, OptionType, Owner, RehydratedTerms, StrikePayment,
 };
 
 /// A distinct 32-byte puzzle hash derived from a seed (never a hard-coded crypto literal —
@@ -530,6 +530,282 @@ fn parse_returns_none_for_non_option() -> anyhow::Result<()> {
     assert!(
         parse(ctx, coin, &puzzle, &solution)?.is_none(),
         "a standard funding-coin spend is not an option"
+    );
+    Ok(())
+}
+
+// ----- transfer -----
+
+#[test]
+fn transfer_moves_option_then_new_owner_exercises() -> anyhow::Result<()> {
+    // Mint an option owned by bob, transfer it to carol, then have CAROL exercise it. The
+    // transfer must actually re-home the singleton (new p2 puzzle hash + a confirmed coin) and
+    // the transferred handle must be fully operable: carol receives the underlying, and the
+    // ORIGINAL creator (alice) still receives the strike. This proves transfer moves only the
+    // ticket, not the underlying terms.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let underlying_amount = 1_000u64;
+    let strike_amount = 250u64;
+
+    let alice = sim.bls(underlying_amount + 1);
+    let bob = bls("holder-bob");
+    let carol = bls("holder-carol");
+    let terms = OptionTerms {
+        creator_puzzle_hash: alice.puzzle_hash,
+        owner_puzzle_hash: bob.puzzle_hash,
+        underlying_amount,
+        strike_type: xch(strike_amount),
+        expiry_seconds: 10_000,
+    };
+    let created = create_confirmed_terms(&mut sim, ctx, &alice, &terms)?;
+
+    // Transfer bob -> carol. The spend must report a signature (bob authorizes it) and produce a
+    // handle whose option lives at carol's puzzle hash.
+    let spend = transfer(ctx, &Owner::Standard(bob.pk), &created, carol.puzzle_hash)?;
+    let transferred = spend
+        .created
+        .clone()
+        .expect("transfer yields the re-homed option");
+    assert_eq!(
+        transferred.option.info.p2_puzzle_hash, carol.puzzle_hash,
+        "the transferred option must live at the new owner's puzzle hash"
+    );
+    assert_eq!(
+        transferred.underlying, created.underlying,
+        "transfer must not change the underlying terms"
+    );
+    let sig = sign_for_sim(&spend.coin_spends, &[bob.sk])?;
+    sim.new_transaction(SpendBundle::new(spend.coin_spends, sig))?;
+    assert!(
+        sim.coin_state(transferred.option.coin.coin_id()).is_some(),
+        "the re-homed option singleton must exist after transfer"
+    );
+
+    // Carol now exercises the transferred option and receives the underlying; alice gets the strike.
+    let strike_funding = sim.new_coin(carol.puzzle_hash, strike_amount);
+    let creator_before = balance(&sim, alice.puzzle_hash);
+    let holder_before = balance(&sim, carol.puzzle_hash);
+    let ex = exercise(
+        ctx,
+        &Owner::Standard(carol.pk),
+        &transferred,
+        &StrikePayment {
+            funding_coin: strike_funding,
+        },
+    )?;
+    let sig = sign_for_sim(&ex.coin_spends, &[carol.sk])?;
+    sim.new_transaction(SpendBundle::new(ex.coin_spends, sig))?;
+
+    assert_eq!(
+        balance(&sim, alice.puzzle_hash) - creator_before,
+        strike_amount,
+        "the original creator receives the strike after a transferred exercise"
+    );
+    assert_eq!(
+        balance(&sim, carol.puzzle_hash) as i128 - holder_before as i128,
+        underlying_amount as i128 - strike_amount as i128,
+        "the NEW owner nets underlying - strike after exercising the transferred option"
+    );
+    Ok(())
+}
+
+#[test]
+fn transfer_rejects_wrong_owner() -> anyhow::Result<()> {
+    // A standard owner that is not the option's current holder is rejected up front.
+    let ctx = &mut SpendContext::new();
+    let alice = bls("alice");
+    let bob = bls("holder-bob");
+    let stranger = bls("stranger");
+    let funding = Coin::new(Bytes32::default(), alice.puzzle_hash, 1_001);
+    let terms = OptionTerms {
+        creator_puzzle_hash: alice.puzzle_hash,
+        owner_puzzle_hash: bob.puzzle_hash,
+        underlying_amount: 1_000,
+        strike_type: xch(1),
+        expiry_seconds: 10,
+    };
+    let created = create(ctx, &Owner::Standard(alice.pk), funding, &terms)?
+        .created
+        .unwrap();
+
+    let err = transfer(
+        ctx,
+        &Owner::Standard(stranger.pk),
+        &created,
+        alice.puzzle_hash,
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("current owner"), "got: {err}");
+    Ok(())
+}
+
+// ----- rehydrate -----
+
+#[test]
+fn rehydrate_recovers_operable_option() -> anyhow::Result<()> {
+    // Reconstruct a full CreatedOption purely from on-chain state (as a wallet that did not mint
+    // the option would): parse the singleton, recover the metadata from the launcher solution,
+    // fetch the underlying coin, rehydrate, and prove the result matches AND is operable by
+    // exercising it. Nothing from the original `created` handle feeds the rehydrated terms.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let underlying_amount = 1_000u64;
+    let strike_amount = 250u64;
+    let expiry = 10_000u64;
+
+    let alice = sim.bls(underlying_amount + 1);
+    let bob = bls("holder");
+    let terms = OptionTerms {
+        creator_puzzle_hash: alice.puzzle_hash,
+        owner_puzzle_hash: bob.puzzle_hash,
+        underlying_amount,
+        strike_type: xch(strike_amount),
+        expiry_seconds: expiry,
+    };
+    let created = create_confirmed_terms(&mut sim, ctx, &alice, &terms)?;
+
+    // 1. Parse the current option singleton from the eve spend (on-chain identity fields only).
+    let eve_coin_id = created.option.coin.parent_coin_info;
+    let eve_coin = sim.coin_state(eve_coin_id).unwrap().coin;
+    let (puzzle, solution) = sim.puzzle_and_solution(eve_coin_id).unwrap();
+    let parsed = parse_child(ctx, eve_coin, &puzzle, &solution)?.expect("an option child");
+
+    // 2. Recover expiry + strike from the launcher solution.
+    let launcher_id = parsed.launcher_id;
+    let (l_puzzle, l_solution) = sim.puzzle_and_solution(launcher_id).unwrap();
+    let _ = l_puzzle;
+    let metadata = parse_metadata(ctx, &l_solution)?;
+    assert_eq!(metadata.expiration_seconds, expiry);
+    assert_eq!(metadata.strike_type, xch(strike_amount));
+
+    // 3. Fetch the underlying coin the option commits to.
+    let underlying_coin = sim.coin_state(parsed.underlying_coin_id).unwrap().coin;
+
+    // 4. Rehydrate — verified against the on-chain commitments.
+    let rehydrated_terms = RehydratedTerms {
+        creator_puzzle_hash: alice.puzzle_hash,
+        expiry_seconds: metadata.expiration_seconds,
+        strike_type: metadata.strike_type,
+    };
+    let rehydrated = rehydrate(&parsed.option, &rehydrated_terms, underlying_coin)?;
+    assert_eq!(
+        rehydrated.underlying, created.underlying,
+        "rehydrated underlying terms must match the minted option"
+    );
+    assert_eq!(
+        rehydrated.underlying_coin, created.underlying_coin,
+        "rehydrated underlying coin must match"
+    );
+
+    // 5. Prove it is operable: bob exercises the rehydrated option.
+    let strike_funding = sim.new_coin(bob.puzzle_hash, strike_amount);
+    let creator_before = balance(&sim, alice.puzzle_hash);
+    let ex = exercise(
+        ctx,
+        &Owner::Standard(bob.pk),
+        &rehydrated,
+        &StrikePayment {
+            funding_coin: strike_funding,
+        },
+    )?;
+    let sig = sign_for_sim(&ex.coin_spends, &[bob.sk])?;
+    sim.new_transaction(SpendBundle::new(ex.coin_spends, sig))?;
+    assert_eq!(
+        balance(&sim, alice.puzzle_hash) - creator_before,
+        strike_amount,
+        "exercising a rehydrated option pays the creator the strike"
+    );
+    Ok(())
+}
+
+#[test]
+fn rehydrate_rejects_wrong_creator() -> anyhow::Result<()> {
+    // A wrong creator puzzle hash changes the underlying's 1-of-2 path hash, so it no longer
+    // matches the underlying coin — rehydrate rejects it rather than yielding an unspendable handle.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let alice = sim.bls(1_001);
+    let created = create_confirmed(&mut sim, ctx, &alice, 1_000, 250, 10_000)?;
+
+    let eve_coin_id = created.option.coin.parent_coin_info;
+    let eve_coin = sim.coin_state(eve_coin_id).unwrap().coin;
+    let (puzzle, solution) = sim.puzzle_and_solution(eve_coin_id).unwrap();
+    let parsed = parse_child(ctx, eve_coin, &puzzle, &solution)?.unwrap();
+    let underlying_coin = sim.coin_state(parsed.underlying_coin_id).unwrap().coin;
+
+    let wrong = RehydratedTerms {
+        creator_puzzle_hash: puzzle_hash("not-the-creator"),
+        expiry_seconds: 10_000,
+        strike_type: xch(250),
+    };
+    let err = rehydrate(&parsed.option, &wrong, underlying_coin).unwrap_err();
+    assert!(format!("{err}").contains("1-of-2 path"), "got: {err}");
+    Ok(())
+}
+
+#[test]
+fn rehydrate_rejects_wrong_strike() -> anyhow::Result<()> {
+    // A wrong strike type is NOT bound by the 1-of-2 path hash (which commits only launcher id +
+    // expiry + creator ph); it is caught solely by the delegated-puzzle-hash check. This test pins
+    // that check so a refactor cannot silently drop it.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let alice = sim.bls(1_001);
+    let created = create_confirmed(&mut sim, ctx, &alice, 1_000, 250, 10_000)?;
+
+    let eve_coin_id = created.option.coin.parent_coin_info;
+    let eve_coin = sim.coin_state(eve_coin_id).unwrap().coin;
+    let (puzzle, solution) = sim.puzzle_and_solution(eve_coin_id).unwrap();
+    let parsed = parse_child(ctx, eve_coin, &puzzle, &solution)?.unwrap();
+    let underlying_coin = sim.coin_state(parsed.underlying_coin_id).unwrap().coin;
+
+    let wrong = RehydratedTerms {
+        creator_puzzle_hash: alice.puzzle_hash,
+        expiry_seconds: 10_000,
+        strike_type: xch(251), // correct creator + expiry, wrong strike amount
+    };
+    let err = rehydrate(&parsed.option, &wrong, underlying_coin).unwrap_err();
+    assert!(
+        format!("{err}").contains("delegated-puzzle hash"),
+        "a wrong strike must be caught by the delegated-puzzle-hash check; got: {err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn rehydrate_rejects_wrong_amount() -> anyhow::Result<()> {
+    // The underlying amount is taken from the supplied coin, so a wrong amount means a coin whose
+    // amount does not match the option's committed underlying. The path hash ignores amount, so the
+    // reconstruction is rejected by the delegated-puzzle-hash check (which commits the amount) — never
+    // silently accepted. Pins that a wrong-amount coin cannot rehydrate.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let alice = sim.bls(1_001);
+    let created = create_confirmed(&mut sim, ctx, &alice, 1_000, 250, 10_000)?;
+
+    let eve_coin_id = created.option.coin.parent_coin_info;
+    let eve_coin = sim.coin_state(eve_coin_id).unwrap().coin;
+    let (puzzle, solution) = sim.puzzle_and_solution(eve_coin_id).unwrap();
+    let parsed = parse_child(ctx, eve_coin, &puzzle, &solution)?.unwrap();
+    let real_coin = sim.coin_state(parsed.underlying_coin_id).unwrap().coin;
+
+    // Same parent + puzzle hash as the real underlying, but a different amount.
+    let wrong_amount_coin = Coin::new(real_coin.parent_coin_info, real_coin.puzzle_hash, 999);
+    let terms = RehydratedTerms {
+        creator_puzzle_hash: alice.puzzle_hash,
+        expiry_seconds: 10_000,
+        strike_type: xch(250),
+    };
+    let err = rehydrate(&parsed.option, &terms, wrong_amount_coin).unwrap_err();
+    assert!(
+        format!("{err}").contains("delegated-puzzle hash") || format!("{err}").contains("coin id"),
+        "a wrong underlying amount must be rejected; got: {err}"
     );
     Ok(())
 }
