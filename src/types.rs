@@ -106,13 +106,17 @@ impl OptionTerms {
     }
 }
 
-/// A created option, returned by [`crate::create`] so the caller can later exercise or claw it
-/// back — both need the option singleton, the underlying terms, and the locked-underlying
-/// coin, which only exist once the create spend is confirmed.
+/// The operable handle for a live option: the option singleton, the underlying terms, and the
+/// locked-underlying coin needed to exercise, transfer, or claw it back.
 ///
-/// The caller must retain this (or the equivalent [`OptionTerms`] plus the confirmed coins) to
-/// operate the option: the terms are not recoverable from the option singleton coin alone
-/// (see [`crate::parse`]).
+/// Returned by [`crate::create`] (the freshly minted option), by [`crate::transfer`] (the option
+/// re-homed to its new owner), and by [`crate::rehydrate`] (reconstructed from on-chain state).
+/// The three fields only exist once the create spend is confirmed.
+///
+/// The terms are not recoverable from the option singleton coin alone (see [`crate::parse`]), so a
+/// caller either retains this handle from `create`/`transfer` or rebuilds it with
+/// [`crate::rehydrate`], which reconstructs and verifies it against the option's on-chain
+/// commitments.
 #[derive(Clone, Debug)]
 pub struct CreatedOption {
     /// The option singleton (the transferable "ticket"); its holder may exercise it.
@@ -125,15 +129,17 @@ pub struct CreatedOption {
     pub underlying_coin: Coin,
 }
 
-/// The result of a dig-options builder: the unsigned coin spends it produced, and — for
-/// [`crate::create`] — the [`CreatedOption`] the caller keeps to operate the option later.
+/// The result of a dig-options builder: the unsigned coin spends it produced, and — for the
+/// builders that yield an operable option — the [`CreatedOption`] handle the caller keeps to
+/// operate it later.
 ///
-/// `created` is `Some` for `create` and `None` for `exercise`/`clawback` (which consume an
-/// existing option rather than producing one).
+/// `created` is `Some` for [`crate::create`] (the minted option) and [`crate::transfer`] (the
+/// option re-homed to its new owner), and `None` for [`crate::exercise`]/[`crate::clawback`],
+/// which consume an existing option rather than producing an ongoing one.
 #[derive(Clone, Debug)]
 pub struct OptionSpend {
     /// The unsigned coin spends this operation produced.
     pub coin_spends: Vec<CoinSpend>,
-    /// The created option — `Some` only for `create`.
+    /// The operable option handle — `Some` for `create` and `transfer`, `None` otherwise.
     pub created: Option<CreatedOption>,
 }

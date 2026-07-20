@@ -26,6 +26,16 @@ before expiry) and **clawback** (strictly after expiry, the creator reclaims the
   exercise use the same `OptionUnderlying::exercise_spend` / `clawback_spend` primitives wrapped for the
   asset; they are additive and land in a later minor version.
 
+**v0.2.0 additions (additive):**
+
+- **`transfer`** — move the option ticket to a new owner (§5.6). Additive; the mint/exercise/clawback
+  envelope is unchanged.
+- **Rehydration (`rehydrate` + `parse_metadata`)** — reconstruct a full, operable `CreatedOption` from
+  on-chain state, verified against the option's commitments (§5.7). This lifts the §5.4 recoverable-fields
+  limitation for a caller willing to supply the creator puzzle hash: `parse` still only inverts identity
+  fields, but `rehydrate` reconstructs + VERIFIES the full terms, so a caller can operate an option it did
+  not mint in the same session.
+
 ## 2. Custody invariants (HARD)
 
 These are the crate's defining properties and MUST hold for every operation:
@@ -88,6 +98,18 @@ The confirmed-option handle the caller retains to operate the option later.
 The identity fields recoverable from an option coin spend (§5.4): `option`, `launcher_id`, `coin_id`,
 `underlying_coin_id`, `underlying_delegated_puzzle_hash`, `p2_puzzle_hash`.
 
+### `RehydratedTerms` (v0.2.0)
+The terms a caller supplies to `rehydrate` (§5.7); each is VERIFIED against the option's on-chain
+commitments, never trusted blindly.
+- `creator_puzzle_hash: Bytes32` — the clawback destination the caller recorded at mint (committed only
+  inside the underlying's clawback path, so it is supplied + verified rather than inverted).
+- `expiry_seconds: u64` — recoverable from the launcher metadata via `parse_metadata`.
+- `strike_type: OptionType` — recoverable from the launcher metadata via `parse_metadata`.
+
+### `OptionMetadata` (v0.2.0, re-exported)
+The launcher key-value metadata `parse_metadata` recovers: `expiration_seconds: u64`,
+`strike_type: OptionType`.
+
 ## 5. Operations
 
 ### 5.1 `create(ctx, creator, funding_coin, terms) -> OptionSpend`
@@ -144,6 +166,47 @@ needs the terms retains the `CreatedOption` / `OptionTerms` from `create`.
 Runs each spend's puzzle to collect its `AGG_SIG_*` conditions and reports the BLS messages the caller
 must sign, given the network's `agg_sig_me` additional data. Performs NO signing.
 
+### 5.6 `transfer(ctx, owner, created, new_owner_puzzle_hash) -> OptionSpend` (v0.2.0)
+Moves the option singleton to a new owner. Spends the singleton through the current `owner`'s p2 layer
+and recreates it (same launcher id, same underlying, same amount, hinted for wallet discovery) at
+`new_owner_puzzle_hash`. Only the ticket moves — the locked underlying coin and the option's terms are
+unchanged.
+- **Enforced invariants:** a `Standard` `owner` whose `standard_puzzle_hash()` ≠ the option's current
+  `p2_puzzle_hash` is rejected up front (§6); a `Custom` owner cannot be checked here and relies on the
+  consensus to reject a wrong-party spend.
+- **Returns** `created: Some(..)` — the option in its NEW-owner state, so the caller can chain further
+  transfers or an exercise/clawback against the transferred singleton once confirmed. (A transferred
+  option remains fully operable: the new owner exercises it and the ORIGINAL creator still receives the
+  strike — test `transfer_moves_option_then_new_owner_exercises`.)
+
+### 5.7 `rehydrate(option, terms, underlying_coin) -> CreatedOption` and `parse_metadata(ctx, launcher_solution) -> OptionMetadata` (v0.2.0)
+Reconstruct a full, operable `CreatedOption` from on-chain state, lifting the §5.4 recoverable-fields
+limitation for a caller that supplies (and lets the crate verify) the creator puzzle hash.
+- **`parse_metadata`** decodes the launcher coin's solution (fetched by the caller) into `OptionMetadata`
+  — recovering `expiration_seconds` and `strike_type`. Network-free.
+- **`rehydrate`** rebuilds the `OptionUnderlying` from `option.info.launcher_id`, the supplied `terms`,
+  and `underlying_coin.amount`, then REJECTS the reconstruction unless ALL THREE on-chain commitments
+  match. Per the chia-wallet-sdk 0.30 `OptionUnderlying` derivation, the three checks bind **disjoint**
+  field sets and are therefore **jointly** load-bearing — none is mere defense-in-depth:
+    1. **1-of-2 path hash** = `underlying_coin.puzzle_hash`. The path is
+       `merkle([exercise_path(launcher_id), clawback_path(expiry, creator_ph)])`, so it binds ONLY the
+       launcher id, expiry, and creator puzzle hash — NOT the amount or strike type. Sole check that
+       catches a wrong **creator puzzle hash**.
+    2. **delegated-puzzle hash** = `option.info.underlying_delegated_puzzle_hash`. The delegated puzzle
+       commits to the expiry, the underlying amount, and the strike type (settlement target +
+       requested-payment amount). Sole check that catches a wrong **strike type**; also catches a wrong
+       amount.
+    3. **underlying coin id** = `option.info.underlying_coin_id`. Binds the coin's full identity
+       (parent + puzzle hash + amount), uniquely rejecting a substituted coin of the right shape but
+       wrong parent.
+  On success the returned `CreatedOption` is operable by `exercise` / `clawback` / `transfer` exactly as
+  one returned by `create`.
+- **Verified, not trusted (security property):** a wrong term cannot produce a `CreatedOption` — it is
+  rejected with `InvalidInput`, never a handle that builds an unspendable or mis-targeted bundle. (Tests:
+  `rehydrate_recovers_operable_option` round-trips create → rehydrate → exercise; `rehydrate_rejects_wrong_creator`
+  asserts a wrong creator puzzle hash is rejected.)
+- **Pure:** both perform no I/O and hold no key.
+
 ## 6. Error taxonomy
 
 `Error` (`thiserror`), `Result<T> = std::result::Result<T, Error>`:
@@ -170,7 +233,8 @@ must sign, given the network's `agg_sig_me` additional data. Performs NO signing
 ```
 An option is created, then reaches exactly one terminal state: **exercised** (strictly before expiry) or
 **clawed-back** (strictly after expiry). Both exits are always reachable — the option is never
-locked-forever (§8.6).
+locked-forever (§8.6). **`transfer` (v0.2.0) is a self-loop on CREATED:** it re-homes the ticket to a new
+owner without changing state or terms; the new owner then exercises or claws back as usual.
 
 ## 8. Security properties (guarantees)
 
@@ -202,6 +266,18 @@ locked-forever (§8.6).
    strands the underlying at a public settlement coin, allowing any mempool watcher to claim it
    key-free even though the holder has paid the strike and received nothing. (Test:
    `exercise_drops_underlying_claim_leaves_coin_strandable`.)
+10. **Rehydration is verified, not trusted (v0.2.0).** `rehydrate` cannot fabricate a `CreatedOption` from
+    wrong terms: it reconstructs the `OptionUnderlying` and rejects it unless the 1-of-2 path hash, the
+    delegated-puzzle hash, and the underlying coin id all match the on-chain option. These three checks
+    bind disjoint field sets and are jointly load-bearing (§5.7): a wrong **creator puzzle hash** is
+    caught only by the path-hash check, a wrong **strike type** only by the delegated-puzzle-hash check,
+    and a substituted same-shape coin only by the coin-id check — so each is rejected with `InvalidInput`
+    rather than yielding a handle that builds an unspendable or mis-targeted bundle. (Tests:
+    `rehydrate_rejects_wrong_creator`, `rehydrate_rejects_wrong_strike`, `rehydrate_rejects_wrong_amount`.)
+11. **Transfer moves only the ticket (v0.2.0).** `transfer` re-homes the option singleton to a new owner
+    and leaves the underlying and terms untouched; a wrong-party `Standard` owner is rejected up front. A
+    transferred option is fully operable — the new owner exercises it and the original creator still
+    receives the strike. (Test: `transfer_moves_option_then_new_owner_exercises`.)
 
 
 ## 9. Conformance
