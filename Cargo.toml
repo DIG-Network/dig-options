@@ -9,12 +9,12 @@
 # broadcasts. See SPEC.md for the normative contract.
 #
 # This is the v0.0.0 bootstrap: it establishes the crate, the release/quality pipeline, and proves
-# the pinned chia-wallet-sdk 0.30 dependency tree resolves + compiles. The complete option builder
+# the pinned chia-wallet-sdk 0.36 dependency tree resolves + compiles. The complete option builder
 # surface (create / exercise / clawback / inspect over XCH + CAT + NFT underlyings and strikes) lands
 # as v0.1.0 in a single triple-gated feature PR against this foundation.
 [package]
 name = "dig-options"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -30,8 +30,8 @@ categories = ["cryptography::cryptocurrencies", "api-bindings"]
 # OptionLauncher / OptionContract / OptionUnderlying primitives, the standard p2 layer, the spend
 # context, and the pure required-signature calculator through it so the chia-* tree resolves to ONE
 # coherent version set.
-chia-wallet-sdk = "0.34"
-# Direct type deps, pinned to EXACTLY the versions chia-wallet-sdk 0.30 resolves to (a mismatch is a
+chia-wallet-sdk = "0.36"
+# Direct type deps, pinned to EXACTLY the versions chia-wallet-sdk 0.36 resolves to (a mismatch is a
 # hard cargo error). chia-protocol carries wire types (`Coin`, `CoinSpend`, `Bytes32`, `Program`).
 chia-protocol = "0.36.1"
 # `Memos` + the offer `SettlementPaymentsSolution` used to build the exercise strike-payment leg.
@@ -46,5 +46,5 @@ thiserror = "2"
 [dev-dependencies]
 # The in-process Chia Simulator + BLS keypair helpers for building + validating real coin spends in
 # tests (create -> exercise round-trip, create -> clawback-on-expiry).
-chia-sdk-test = "0.34"
+chia-sdk-test = "0.36"
 anyhow = "1"
