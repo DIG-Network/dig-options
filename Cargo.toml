@@ -30,7 +30,7 @@ categories = ["cryptography::cryptocurrencies", "api-bindings"]
 # OptionLauncher / OptionContract / OptionUnderlying primitives, the standard p2 layer, the spend
 # context, and the pure required-signature calculator through it so the chia-* tree resolves to ONE
 # coherent version set.
-chia-wallet-sdk = "0.34"
+chia-wallet-sdk = "0.36"
 # Direct type deps, pinned to EXACTLY the versions chia-wallet-sdk 0.30 resolves to (a mismatch is a
 # hard cargo error). chia-protocol carries wire types (`Coin`, `CoinSpend`, `Bytes32`, `Program`).
 chia-protocol = "0.36.1"
@@ -46,5 +46,5 @@ thiserror = "2"
 [dev-dependencies]
 # The in-process Chia Simulator + BLS keypair helpers for building + validating real coin spends in
 # tests (create -> exercise round-trip, create -> clawback-on-expiry).
-chia-sdk-test = "0.34"
+chia-sdk-test = "0.36"
 anyhow = "1"
