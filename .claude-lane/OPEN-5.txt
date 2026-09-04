@@ -1,2 +1,0 @@
-lane: #5 strike-funding change output
-branch: fix/5-strike-change
