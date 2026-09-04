@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.5.0] - 2026-09-04
+
+### Bug Fixes
+- **exercise:** Return strike-funding change to the funding coin instead of burning it (#6)
+
 ## [0.4.1] - 2026-09-04
 
 ### Documentation
