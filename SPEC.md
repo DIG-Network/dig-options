@@ -131,9 +131,16 @@ requested payment.
 - **Enforced invariants:** `created.underlying.strike_type` is `Xch` (else error, §6); `strike.funding_coin.amount`
   ≥ the strike amount; the exercise's `AssertBeforeSecondsAbsolute(expiry)` boundary is enforced by the
   consensus (valid strictly before expiry).
+- **Strike change:** when `strike.funding_coin.amount` EXCEEDS the strike amount, the strike-funding spend
+  MUST emit a second `CreateCoin` paying the difference to `strike.funding_coin.puzzle_hash` — the funding
+  coin's OWN puzzle hash. The change destination is never caller-supplied: the layer that authorized the
+  spend already controls it, so change cannot reach a puzzle hash the funder did not already own. When the
+  amounts are EQUAL no change output is emitted (never a zero-amount coin).
+- **No implicit fee:** this builder takes NO fee. `sum(inputs) == sum(outputs)` across the returned spends;
+  an oversized funding coin loses nothing. A caller that wants a network fee attaches its own fee spend.
 - **Value conservation:** the underlying is CLAIMED to the holder in the same bundle (no bare settlement
   coin holding the underlying survives — nothing is left for a key-free thief); the strike is paid to the
-  creator's requested payment. No value is created.
+  creator's requested payment, and any excess strike funding returns to the funder. No value is created.
 - **Builder-enforced underlying claim:** the returned `coin_spends` carry a settlement spend that claims
   the underlying to the holder. **Consensus enforces the strike payment to the creator, but does NOT
   enforce the underlying claim — only the builder enforces it.** Callers MUST broadcast the full
