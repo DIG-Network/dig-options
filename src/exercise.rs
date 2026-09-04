@@ -22,8 +22,9 @@ use crate::types::{CreatedOption, OptionSpend, Owner};
 /// The strike payment funding a [`exercise`]: the caller-supplied XCH coin the holder spends
 /// to pay the strike into the settlement puzzle.
 ///
-/// It must hold at least the strike amount (`created.underlying.strike_type.amount()`); any
-/// excess is left as an implicit fee.
+/// It must hold at least the strike amount (`created.underlying.strike_type.amount()`). Any
+/// excess over the strike is returned as change to this coin's OWN `puzzle_hash`, so an
+/// oversized funding coin loses nothing; the builder itself takes no fee.
 #[derive(Clone, Copy, Debug)]
 pub struct StrikePayment {
     /// The XCH coin the holder spends to fund the strike payment.
@@ -113,10 +114,33 @@ pub fn exercise(
 
     // Pay the XCH strike into the settlement puzzle, then settle it to the creator's
     // requested payment. The holder authorizes the strike-funding spend.
-    let strike_inner = holder.spend_with_conditions(
-        ctx,
-        Conditions::new().create_coin(SETTLEMENT_PAYMENT_HASH.into(), strike_amount, Memos::None),
-    )?;
+    //
+    // Any excess over the strike is returned as CHANGE to the funding coin's OWN puzzle hash.
+    // Without this the whole funding coin is consumed and the difference is burned as an
+    // implicit network fee — an unbounded, silent loss, because a caller selecting the smallest
+    // spendable coin at the owner's address routinely finds one far larger than the strike.
+    // The change destination is the funding coin's existing puzzle hash rather than a new
+    // caller-supplied field: the same layer already controls it, so change cannot be redirected
+    // anywhere the funder did not already own. This builder takes NO fee; a caller that wants
+    // one attaches its own fee spend.
+    let mut strike_conditions =
+        Conditions::new().create_coin(SETTLEMENT_PAYMENT_HASH.into(), strike_amount, Memos::None);
+
+    // Only when there IS excess — an exact-size funding coin must not emit a zero-amount coin.
+    if let Some(change_amount) = strike
+        .funding_coin
+        .amount
+        .checked_sub(strike_amount)
+        .filter(|excess| *excess > 0)
+    {
+        strike_conditions = strike_conditions.create_coin(
+            strike.funding_coin.puzzle_hash,
+            change_amount,
+            Memos::None,
+        );
+    }
+
+    let strike_inner = holder.spend_with_conditions(ctx, strike_conditions)?;
     ctx.spend(strike.funding_coin, strike_inner)?;
 
     let settlement_coin = Coin::new(

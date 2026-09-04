@@ -355,6 +355,139 @@ fn exercise_leaves_no_orphan_underlying_settlement_coin() -> anyhow::Result<()> 
 }
 
 #[test]
+fn exercise_returns_strike_change_to_the_funding_coin() -> anyhow::Result<()> {
+    // An OVERSIZED strike-funding coin must not have its excess burned as an implicit fee.
+    // dig-node selects the SMALLEST spendable coin at the owner's address with
+    // `amount >= strike`, and after a mint the underlying + launcher change both land back at
+    // that same address — so a wallet routinely holds ONE large consolidated coin there and the
+    // "smallest" coin is still far bigger than the strike. Burning the difference is a silent,
+    // unbounded loss with no consent surface.
+    //
+    // Every other exercise test funds the strike with EXACTLY the strike amount, which is the
+    // one case where this defect is invisible; this test funds it with ~20x the strike.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let underlying_amount = 1_000u64;
+    let strike_amount = 250u64;
+    let excess = 4_750u64;
+    let funding_amount = strike_amount + excess;
+
+    let alice = sim.bls(underlying_amount + 1);
+    let bob = bls("holder");
+    let terms = OptionTerms {
+        creator_puzzle_hash: alice.puzzle_hash,
+        owner_puzzle_hash: bob.puzzle_hash,
+        underlying_amount,
+        strike_type: xch(strike_amount),
+        expiry_seconds: 10_000,
+    };
+    let created = create_confirmed_terms(&mut sim, ctx, &alice, &terms)?;
+
+    // Fund the strike from a coin far LARGER than the strike. Snapshot balances AFTER funding,
+    // so the whole funding coin sits in the holder's baseline and his net gain is exactly
+    // (underlying received - strike paid) when — and only when — the excess comes back.
+    let strike_funding = sim.new_coin(bob.puzzle_hash, funding_amount);
+    let creator_before = balance(&sim, alice.puzzle_hash);
+    let holder_before = balance(&sim, bob.puzzle_hash);
+
+    let spend = exercise(
+        ctx,
+        &Owner::Standard(bob.pk),
+        &created,
+        &StrikePayment {
+            funding_coin: strike_funding,
+        },
+    )?;
+    let sig = sign_for_sim(&spend.coin_spends, &[bob.sk])?;
+    sim.new_transaction(SpendBundle::new(spend.coin_spends, sig))?;
+
+    // The change coin is created at the FUNDING COIN'S OWN puzzle hash, parented by the funding
+    // coin, for exactly the excess — no new destination, nowhere the holder did not already own.
+    let change_coin = Coin::new(strike_funding.coin_id(), strike_funding.puzzle_hash, excess);
+    assert!(
+        sim.coin_state(change_coin.coin_id()).is_some(),
+        "the {excess} excess over the {strike_amount} strike must return to the funding coin's own puzzle hash as change"
+    );
+
+    // Value conservation: the consensus already forbids creating value, so any shortfall here IS
+    // burned fee. The holder must net exactly (underlying - strike) — not (underlying - funding).
+    let creator_gain = balance(&sim, alice.puzzle_hash) - creator_before;
+    let holder_gain = balance(&sim, bob.puzzle_hash) as i128 - holder_before as i128;
+    assert_eq!(
+        creator_gain, strike_amount,
+        "the creator should still receive exactly the strike ({strike_amount})"
+    );
+    assert_eq!(
+        holder_gain,
+        underlying_amount as i128 - strike_amount as i128,
+        "the holder must net underlying - strike; the {excess} excess must be returned as change, not burned as an implicit fee"
+    );
+    Ok(())
+}
+
+#[test]
+fn exercise_emits_no_change_coin_for_an_exact_strike_funding_coin() -> anyhow::Result<()> {
+    // GUARD (not a red-for-the-defect test): when the funding coin exactly covers the strike
+    // there is no excess, and the builder must emit NO change output rather than a zero-amount
+    // coin. This fails against the naive fix (an UNCONDITIONAL change `create_coin`), which is
+    // what it exists to catch; it passes both before and after the correct fix.
+    let mut sim = Simulator::new();
+    let ctx = &mut SpendContext::new();
+
+    let underlying_amount = 1_000u64;
+    let strike_amount = 250u64;
+
+    let alice = sim.bls(underlying_amount + 1);
+    let bob = bls("holder");
+    let terms = OptionTerms {
+        creator_puzzle_hash: alice.puzzle_hash,
+        owner_puzzle_hash: bob.puzzle_hash,
+        underlying_amount,
+        strike_type: xch(strike_amount),
+        expiry_seconds: 10_000,
+    };
+    let created = create_confirmed_terms(&mut sim, ctx, &alice, &terms)?;
+
+    // Funding coin covers the strike EXACTLY — excess is zero.
+    let strike_funding = sim.new_coin(bob.puzzle_hash, strike_amount);
+    let holder_before = balance(&sim, bob.puzzle_hash);
+
+    let spend = exercise(
+        ctx,
+        &Owner::Standard(bob.pk),
+        &created,
+        &StrikePayment {
+            funding_coin: strike_funding,
+        },
+    )?;
+    let sig = sign_for_sim(&spend.coin_spends, &[bob.sk])?;
+    sim.new_transaction(SpendBundle::new(spend.coin_spends, sig))?;
+
+    // No zero-amount change coin was created at the funding coin's puzzle hash.
+    let zero_change = Coin::new(strike_funding.coin_id(), strike_funding.puzzle_hash, 0);
+    assert!(
+        sim.coin_state(zero_change.coin_id()).is_none(),
+        "an exact-size funding coin must produce NO change output, never a zero-amount coin"
+    );
+    assert!(
+        !sim.unspent_coins(bob.puzzle_hash, false)
+            .iter()
+            .any(|c| c.amount == 0),
+        "no zero-amount coin may be left at the holder's puzzle hash"
+    );
+
+    // The exercise still settles correctly: holder nets underlying - strike.
+    let holder_gain = balance(&sim, bob.puzzle_hash) as i128 - holder_before as i128;
+    assert_eq!(
+        holder_gain,
+        underlying_amount as i128 - strike_amount as i128,
+        "an exact-size funding coin must still net the holder underlying - strike"
+    );
+    Ok(())
+}
+
+#[test]
 fn create_then_clawback_on_expiry() -> anyhow::Result<()> {
     let mut sim = Simulator::new();
     let ctx = &mut SpendContext::new();
